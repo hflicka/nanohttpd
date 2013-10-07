@@ -53,11 +53,11 @@ import java.util.*;
  */
 public abstract class NanoHTTPD {
     /**
-     * Maximum time to wait on Socket.getInputStream().read() (in milliseconds)
+     * Maximum time to wait on Socket.getInputStream().read()
      * This is required as the Keep-Alive HTTP connections would otherwise
      * block the socket reading thread forever (or as long the browser is open).
      */
-    public static final int SOCKET_READ_TIMEOUT = 5000;
+    public static final int SOCKET_READ_TIMEOUT = 2000;
     /**
      * Common mime type for dynamic content: plain text
      */
@@ -73,7 +73,7 @@ public abstract class NanoHTTPD {
     private final String hostname;
     private final int myPort;
     private ServerSocket myServerSocket;
-    private Thread myThread;
+    private ServerThread myServerThread;
     /**
      * Pluggable strategy for asynchronously executing requests.
      */
@@ -83,17 +83,20 @@ public abstract class NanoHTTPD {
      */
     private TempFileManagerFactory tempFileManagerFactory;
 
+    private final ExceptionHandler exceptionHandler;
+
     /**
      * Constructs an HTTP server on given port.
      */
-    public NanoHTTPD(int port) {
-        this(null, port);
+    public NanoHTTPD(int port, ExceptionHandler exceptionHandler) {
+        this(null, port, exceptionHandler);
     }
 
     /**
      * Constructs an HTTP server on given hostname and port.
      */
-    public NanoHTTPD(String hostname, int port) {
+    public NanoHTTPD(String hostname, int port, ExceptionHandler exceptionHandler) {
+        this.exceptionHandler = exceptionHandler;
         this.hostname = hostname;
         this.myPort = port;
         setTempFileManagerFactory(new DefaultTempFileManagerFactory());
@@ -136,50 +139,10 @@ public abstract class NanoHTTPD {
         myServerSocket = new ServerSocket();
         myServerSocket.bind((hostname != null) ? new InetSocketAddress(hostname, myPort) : new InetSocketAddress(myPort));
 
-        myThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                do {
-                    try {
-                        final Socket finalAccept = myServerSocket.accept();
-                        finalAccept.setSoTimeout(SOCKET_READ_TIMEOUT);
-                        final InputStream inputStream = finalAccept.getInputStream();
-                        if (inputStream == null) {
-                            safeClose(finalAccept);
-                        } else {
-                            asyncRunner.exec(new Runnable() {
-                                @Override
-                                public void run() {
-                                    OutputStream outputStream = null;
-                                    try {
-                                        outputStream = finalAccept.getOutputStream();
-                                        TempFileManager tempFileManager = tempFileManagerFactory.create();
-                                        HTTPSession session = new HTTPSession(tempFileManager, inputStream, outputStream);
-                                        while (!finalAccept.isClosed()) {
-                                            session.execute();
-                                        }
-                                    } catch (Exception e) {
-                                        // When the socket is closed by the client, we throw our own SocketException
-                                        // to break the  "keep alive" loop above.
-                                        if (!(e instanceof SocketException && "NanoHttpd Shutdown".equals(e.getMessage()))) {
-                                            e.printStackTrace();
-                                        }
-                                    } finally {
-                                        safeClose(outputStream);
-                                        safeClose(inputStream);
-                                        safeClose(finalAccept);
-                                    }
-                                }
-                            });
-                        }
-                    } catch (IOException e) {
-                    }
-                } while (!myServerSocket.isClosed());
-            }
-        });
-        myThread.setDaemon(true);
-        myThread.setName("NanoHttpd Main Listener");
-        myThread.start();
+        myServerThread = new ServerThread();
+        myServerThread.setDaemon(true);
+        myServerThread.setName("NanoHttpd Main Listener");
+        myServerThread.start();
     }
 
     /**
@@ -187,10 +150,13 @@ public abstract class NanoHTTPD {
      */
     public void stop() {
         try {
+            asyncRunner.quitAll();
             safeClose(myServerSocket);
-            myThread.join();
-        } catch (Exception e) {
-            e.printStackTrace();
+            myServerThread.join();
+            myServerSocket = null;
+            myServerThread = null;
+        } catch (InterruptedException e) {
+            exceptionHandler.handleException(e);
         }
     }
 
@@ -200,11 +166,11 @@ public abstract class NanoHTTPD {
     }
 
     public final boolean wasStarted() {
-        return myServerSocket != null && myThread != null;
+        return myServerSocket != null && myServerThread != null;
     }
 
     public final boolean isAlive() {
-        return wasStarted() && !myServerSocket.isClosed() && myThread.isAlive();
+        return wasStarted() && !myServerSocket.isClosed() && myServerThread.isAlive();
     }
 
     /**
@@ -355,7 +321,8 @@ public abstract class NanoHTTPD {
      * Pluggable strategy for asynchronously executing requests.
      */
     public interface AsyncRunner {
-        void exec(Runnable code);
+        void exec(ClientHandler code);
+        void quitAll();
     }
 
     /**
@@ -403,13 +370,28 @@ public abstract class NanoHTTPD {
     public static class DefaultAsyncRunner implements AsyncRunner {
         private long requestCount;
 
+        List<ClientHandler> started;
+
+        public DefaultAsyncRunner() {
+            this.requestCount = 0;
+            started = new LinkedList<ClientHandler>();
+        }
+
         @Override
-        public void exec(Runnable code) {
+        public void exec(ClientHandler handler) {
             ++requestCount;
-            Thread t = new Thread(code);
-            t.setDaemon(true);
-            t.setName("NanoHttpd Request Processor (#" + requestCount + ")");
-            t.start();
+            handler.setDaemon(true);
+            handler.setName("NanoHttpd Request Processor (#" + requestCount + ")");
+            handler.start();
+            started.add(handler);
+        }
+
+        @Override
+        public void quitAll() {
+            for (ClientHandler handler : started) {
+                handler.quit();
+            }
+            started.clear();
         }
     }
 
@@ -827,7 +809,7 @@ public abstract class NanoHTTPD {
                     r.send(outputStream);
                 }
             } catch (SocketException e) {
-                // throw it out to close socket object (finalAccept)
+                // throw it out to close socket object (acceptSocket)
                 throw e;
             } catch (IOException ioe) {
                 Response r = new Response(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "SERVER INTERNAL ERROR: IOException: " + ioe.getMessage());
@@ -1114,7 +1096,7 @@ public abstract class NanoHTTPD {
                     dest.write(src.slice());
                     path = tempFile.getName();
                 } catch (Exception e) { // Catch exception if any
-                    System.err.println("Error: " + e.getMessage());
+                    exceptionHandler.handleException(e);
                 } finally {
                     safeClose(fileOutputStream);
                 }
@@ -1127,7 +1109,7 @@ public abstract class NanoHTTPD {
                 TempFile tempFile = tempFileManager.createTempFile();
                 return new RandomAccessFile(tempFile.getName(), "rw");
             } catch (Exception e) {
-                System.err.println("Error: " + e.getMessage());
+                exceptionHandler.handleException(e);
             }
             return null;
         }
@@ -1304,6 +1286,69 @@ public abstract class NanoHTTPD {
             for (Cookie cookie : queue) {
                 response.addHeader("Set-Cookie", cookie.getHTTPHeader());
             }
+        }
+    }
+
+    public interface ExceptionHandler {
+        void handleException(Exception e);
+    }
+
+    public class ClientHandler extends Thread {
+        private final Socket acceptSocket;
+        private final InputStream inputStream;
+
+        public ClientHandler(Socket acceptSocket, InputStream inputStream) {
+            this.acceptSocket = acceptSocket;
+            this.inputStream = inputStream;
+        }
+
+        @Override
+        public void run() {
+            OutputStream outputStream = null;
+            try {
+                outputStream = acceptSocket.getOutputStream();
+                TempFileManager tempFileManager = tempFileManagerFactory.create();
+                HTTPSession session = new HTTPSession(tempFileManager, inputStream, outputStream);
+                while (!acceptSocket.isClosed()) {
+                    session.execute();
+                }
+            } catch (Exception e) {
+                // When the socket is closed by the client, we throw our own SocketException
+                // to break the  "keep alive" loop above.
+                if (!(e instanceof SocketException)) {
+                    exceptionHandler.handleException(e);
+                }
+            } finally {
+                safeClose(outputStream);
+                safeClose(inputStream);
+                safeClose(acceptSocket);
+            }
+        }
+
+        public void quit() {
+            safeClose(acceptSocket);
+        }
+    }
+
+    public class ServerThread extends Thread {
+
+        private Socket acceptSocket;
+
+        @Override
+        public void run() {
+            do {
+                try {
+                    acceptSocket = myServerSocket.accept();
+                    acceptSocket.setSoTimeout(SOCKET_READ_TIMEOUT);
+                    final InputStream inputStream = acceptSocket.getInputStream();
+                    if (inputStream == null) {
+                        safeClose(acceptSocket);
+                    } else {
+                        asyncRunner.exec(new ClientHandler(acceptSocket, inputStream));
+                    }
+                } catch (IOException e) {
+                }
+            } while (!myServerSocket.isClosed());
         }
     }
 }
